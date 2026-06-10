@@ -60,16 +60,17 @@ impl StreamUtil {
     ///
     /// A single supervising task drives BOTH directions:
     ///
-    /// - A clean EOF in one direction forwards the close marker
-    ///   (`finish()` / `shutdown()`) and lets the opposite direction
-    ///   keep draining, preserving graceful half-close semantics.
-    /// - An error or idle timeout in EITHER direction tears the whole
-    ///   relay down deterministically: the QUIC send stream is reset,
-    ///   the QUIC recv stream is stopped, the TCP write half is shut
-    ///   down, and all halves are dropped so the TCP socket fully
-    ///   closes. The peer relay observes the reset and tears down its
-    ///   end the same way, so the tunneled TCP endpoints see a clean
-    ///   close and can re-establish.
+    /// - EITHER direction ending — clean EOF, error, or idle timeout —
+    ///   tears the whole relay down deterministically: the QUIC send
+    ///   stream is reset (unless it already finished cleanly), the QUIC
+    ///   recv stream is stopped, the TCP write half is shut down, and
+    ///   all halves are dropped so the TCP socket fully closes. The
+    ///   peer relay observes the reset/finish and tears down its end
+    ///   the same way, so the tunneled TCP endpoints see a close and
+    ///   can re-establish. (Half-close draining is deliberately NOT
+    ///   supported: the cancelled opposite pump may have lost a
+    ///   partially-written chunk, and continuing after a silent gap
+    ///   would desync the tunneled protocol — see the teardown comment.)
     /// - `stream_timeout_ms == 0` disables the per-stream idle timeout
     ///   entirely (long-lived trunk streams stay up while idle).
     ///
@@ -119,49 +120,40 @@ impl StreamUtil {
                 ) => ("quic_to_tcp", end),
             };
 
-            // Graceful half-close: after a clean EOF the opposite
-            // direction may still carry in-flight data — drain it to
-            // its own end before tearing down. Errors and timeouts
-            // skip the drain and tear down immediately.
-            let mut second_end: Option<PumpEnd> = None;
-            if matches!(first_end, PumpEnd::Eof) {
-                second_end = Some(if first_dir == "tcp_to_quic" {
-                    Self::pump_quic_to_stream(
-                        &mut quic_recv,
-                        &mut stream_write,
-                        &mut down_bytes,
-                        stream_timeout_ms,
-                    )
-                    .await
-                } else {
-                    Self::pump_stream_to_quic(
-                        &mut stream_read,
-                        &mut quic_send,
-                        &mut up_bytes,
-                        stream_timeout_ms,
-                    )
-                    .await
-                });
+            // Either direction ending — for ANY reason — tears the whole
+            // relay down immediately. The cancelled (select!-loser) pump
+            // must NOT be resumed: write_all is not cancellation-safe, so
+            // the loser may have read bytes it never finished writing.
+            // Resuming it would continue the stream AFTER a silent gap,
+            // desyncing the tunneled protocol for the rest of the stream
+            // — strictly worse than truncating at teardown, which
+            // endpoints already handle as a connection close.
+            //
+            // Teardown is a no-op (ignored error) on already-closed
+            // halves. Dropping all four halves at the end of this task
+            // closes the underlying TCP socket.
+            //
+            // reset() is gated: when the TCP→QUIC pump ended at clean
+            // TCP EOF it already called quic_send.finish(), and Quinn
+            // keeps retransmitting finished-stream data after the handle
+            // drops (drop only auto-resets UNfinished streams). An
+            // unconditional reset here would transition DataSent →
+            // ResetSent and abandon the unacked tail — destroying the
+            // very bytes just relayed (very plausible on a high-RTT
+            // lossy path). Only reset when the send side did NOT finish
+            // cleanly.
+            let clean_finish =
+                first_dir == "tcp_to_quic" && matches!(first_end, PumpEnd::Eof);
+            if !clean_finish {
+                let _ = quic_send.reset(0u32.into());
             }
-
-            // Deterministic teardown of everything still open. Each
-            // call is a no-op (ignored error) on an already-closed
-            // half. Dropping the halves at the end of this task closes
-            // the underlying TCP socket.
-            let _ = quic_send.reset(0u32.into());
             let _ = quic_recv.stop(0u32.into());
             let _ = stream_write.shutdown().await;
 
-            match second_end {
-                Some(second) => info!(
-                    "[{tag}] relay {index} ended, first:{first_dir} {first_end}, then:{second}, \
-                     up:{up_bytes}B down:{down_bytes}B, peer:{peer_addr}"
-                ),
-                None => info!(
-                    "[{tag}] relay {index} ended, {first_dir} {first_end}, \
-                     up:{up_bytes}B down:{down_bytes}B, peer:{peer_addr}"
-                ),
-            }
+            info!(
+                "[{tag}] relay {index} ended, {first_dir} {first_end}, \
+                 up:{up_bytes}B down:{down_bytes}B, peer:{peer_addr}"
+            );
         });
     }
 
