@@ -223,7 +223,7 @@ struct ClientArgs {
     #[arg(long, default_value_t = 30000)]
     quic_timeout_ms: u64,
 
-    /// TCP idle timeout in milliseconds
+    /// TCP idle timeout in milliseconds (0 disables the per-stream idle timeout)
     #[arg(long, default_value_t = 30000)]
     tcp_timeout_ms: u64,
 
@@ -337,7 +337,7 @@ struct ServerArgs {
     #[arg(long, default_value_t = 30000)]
     quic_timeout_ms: u64,
 
-    /// TCP idle timeout in milliseconds
+    /// TCP idle timeout in milliseconds (0 disables the per-stream idle timeout)
     #[arg(long, default_value_t = 30000)]
     tcp_timeout_ms: u64,
 
